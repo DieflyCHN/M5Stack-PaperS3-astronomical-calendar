@@ -81,6 +81,36 @@ GregorianTime unixToGregorian(int64_t unixUTC) {
     return g;
 }
 
+void setupTimezoneBerlin() {
+    setenv("TZ", "CET-1CEST,M3.5.0/2,M10.5.0/3", 1);
+    tzset();
+}
+
+int64_t gregorianToUnixUTC(
+    int year,
+    int month,
+    int day,
+    int hour,
+    int minute,
+    int second)
+{
+    struct tm t = {};
+
+    t.tm_year = year - 1900;
+    t.tm_mon  = month - 1;
+    t.tm_mday = day;
+
+    t.tm_hour = hour;
+    t.tm_min  = minute;
+    t.tm_sec  = second;
+
+    setenv("TZ", "UTC0", 1);
+    tzset();
+    int64_t result = (int64_t)mktime(&t);
+    setupTimezoneBerlin();   // 恢复全局时区
+    return result;
+}
+
 const char *weekdayStrCHN[] = {"星期日","星期一","星期二","星期三",
     "星期四","星期五","星期六"};
 // 初始化 GregorianTime
@@ -89,11 +119,6 @@ GregorianTime utcGregorian;
 /*
     本地时间部分
 */
-void setupTimezoneBerlin() {
-    setenv("TZ", "CET-1CEST,M3.5.0/2,M10.5.0/3", 1);
-    tzset();
-}
-
 int64_t unixToBerlinUnixLocal(int64_t unixUTC) {
     time_t now = unixUTC;
 
@@ -210,11 +235,76 @@ ChineseHour dayGanzhiToHourGanzhi(const Ganzhi& dayGanzhi, int hour, int minute)
 
     return sz;
 }
+/*
+    RTC
+*/
+bool saveUnixClockToRTC(const UnixClock& clock) {
+    if (!clock.valid) return false;
+    if (!M5.Rtc.isEnabled()) return false;
+
+    time_t now = (time_t)clock.unixUTC;
+    struct tm t;
+    gmtime_r(&now, &t);   // RTC 内部统一存 UTC
+
+    m5::rtc_datetime_t rtc;
+    rtc.date.year  = t.tm_year + 1900;
+    rtc.date.month = t.tm_mon + 1;
+    rtc.date.date  = t.tm_mday;
+    rtc.date.weekDay = t.tm_wday;
+
+    rtc.time.hours   = t.tm_hour;
+    rtc.time.minutes = t.tm_min;
+    rtc.time.seconds = t.tm_sec;
+
+    M5.Rtc.setDateTime(rtc);
+    return true;
+}
+bool loadUnixClockFromRTC(UnixClock& clock) {
+    if (!M5.Rtc.isEnabled()) return false;
+
+    auto rtc = M5.Rtc.getDateTime();
+
+    int year  = rtc.date.year;
+    int month = rtc.date.month;
+    int day   = rtc.date.date;
+
+    if (year < 2024 || year > 2100) return false;
+    if (month < 1 || month > 12) return false;
+    if (day < 1 || day > 31) return false;
+
+    struct tm t = {};
+
+    t.tm_year = year - 1900;
+    t.tm_mon  = month - 1;
+    t.tm_mday = day;
+
+    t.tm_hour = rtc.time.hours;
+    t.tm_min  = rtc.time.minutes;
+    t.tm_sec  = rtc.time.seconds;
+
+    // 因为 RTC 里存的是 UTC，所以不能用 mktime()
+    int64_t unixUTC = gregorianToUnixUTC(
+        year,
+        month,
+        day,
+        rtc.time.hours,
+        rtc.time.minutes,
+        rtc.time.seconds
+    );
+
+    setUnixClock(clock, unixUTC);
+    return true;
+}
+uint32_t lastRTCSaveMillis = 0;
+constexpr uint32_t RTC_SAVE_INTERVAL_MS = 60000;
+constexpr bool FORCE_RESET_RTC_FROM_BUILD_TIME = false; // 手动操作是否写入 Build 时间，使用后再改回
+const char* timeSource = "UNKNOWN";
 // --------------------------------------------------------------------------------
 void setup() {
     // 初始化整机
     auto cfg = M5.config();
     M5.begin(cfg);
+    M5.Rtc.begin();
 
     // 设置屏幕方向
     M5.Display.setRotation(0);
@@ -235,14 +325,30 @@ void setup() {
     M5.Display.setTextSize(2.5);
     // 设置时区
     setupTimezoneBerlin();
-    // 测试用 Unix UTC
-    // setUnixClock(clockUnix, 1717411200); 
-    setUnixClock(clockUnix, getBuildUnixUTC());
+
+    if (FORCE_RESET_RTC_FROM_BUILD_TIME) {
+        setUnixClock(clockUnix, getBuildUnixUTC());
+        saveUnixClockToRTC(clockUnix);
+        timeSource = "FORCE BUILD";
+    } else if (loadUnixClockFromRTC(clockUnix)) {
+        timeSource = "RTC";
+    } else {
+        setUnixClock(clockUnix, getBuildUnixUTC());
+        saveUnixClockToRTC(clockUnix);
+        timeSource = "BUILD";
+    }
 }
 // --------------------------------------------------------------------------------
 void loop() {
     // 初始化时间
     tickUnixClock(clockUnix);
+    uint32_t currentMillis = millis();
+
+    if (clockUnix.valid &&
+        (uint32_t)(currentMillis - lastRTCSaveMillis) >= RTC_SAVE_INTERVAL_MS) {
+        saveUnixClockToRTC(clockUnix);
+        lastRTCSaveMillis = currentMillis;
+    }
 
     int64_t nowUTC = getUnixTimeUTC(clockUnix);
     int64_t nowBER = unixToBerlinUnixLocal(nowUTC);
@@ -308,4 +414,7 @@ void loop() {
     M5.Display.printf("某某 某某 %s%s %s%s%s%s刻",
         beiDayGanzhi.gan, beiDayGanzhi.zhi,
         beiShichen.hourGan,beiShichen.hourZhi,beiShichen.chuZheng,beiShichen.ke);
+    // 显示校时来源
+    M5.Display.setCursor(0,LINEHEIGHT*11);
+    M5.Display.printf("SRC:%s",timeSource);
 }
